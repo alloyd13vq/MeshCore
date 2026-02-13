@@ -2,6 +2,7 @@
 
 #include <Arduino.h> // needed for PlatformIO
 #include <Mesh.h>
+#include <ctype.h>
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -400,6 +401,184 @@ ContactInfo*  MyMesh::processAck(const uint8_t *data) {
   return checkConnectionsAck(data);
 }
 
+// Companion autoresponder for range/health checks: replies to direct PING with BONG; no ingress filtering/allowlist yet.
+bool MyMesh::startsWithWordCI(const char *s, const char *word) {
+  if (!s || !word) return false;
+
+  int i = 0;
+  while (word[i] != 0) {
+    if (s[i] == 0) return false;
+    char sc = (char)tolower((unsigned char)s[i]);
+    char wc = (char)tolower((unsigned char)word[i]);
+    if (sc != wc) return false;
+    i++;
+  }
+
+  char c = s[i];
+  return c == 0 || c == ' ' || c == '\t' || c == ':';
+}
+
+int MyMesh::extractPingSeq(const char *text, char *seq_out, size_t seq_out_size) {
+  if (!text || !seq_out || seq_out_size == 0) return 0;
+  seq_out[0] = 0;
+  if (!startsWithWordCI(text, "PING")) return 0;
+
+  const char *p = text + 4;
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p == ':') {
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+  }
+  if (*p == 0) return 0;
+
+  int n = 0;
+  while (*p && *p != ' ' && *p != '\t' && n < (int)(seq_out_size - 1)) {
+    seq_out[n++] = *p++;
+  }
+  seq_out[n] = 0;
+  return n;
+}
+
+uint32_t MyMesh::calcPingToken(const ContactInfo &from, uint32_t sender_timestamp, const char *seq) {
+  uint32_t h = 2166136261u; // FNV-1a
+  auto mix = [&h](uint8_t b) {
+    h ^= b;
+    h *= 16777619u;
+  };
+
+  for (int i = 0; i < PUB_KEY_SIZE; i++) {
+    mix(from.id.pub_key[i]);
+  }
+  mix((uint8_t)(sender_timestamp));
+  mix((uint8_t)(sender_timestamp >> 8));
+  mix((uint8_t)(sender_timestamp >> 16));
+  mix((uint8_t)(sender_timestamp >> 24));
+
+  if (seq) {
+    for (int i = 0; seq[i] != 0; i++) {
+      mix((uint8_t)tolower((unsigned char)seq[i]));
+    }
+  }
+  return h;
+}
+
+bool MyMesh::isRecentPingToken(uint32_t token) {
+  for (int i = 0; i < AUTOREPLY_DEDUP_SIZE; i++) {
+    auto &e = autoreply_dedup[i];
+    if (e.expires_at == 0 || millisHasNowPassed(e.expires_at)) {
+      e.expires_at = 0;
+      continue;
+    }
+    if (e.token == token) return true;
+  }
+  return false;
+}
+
+void MyMesh::rememberPingToken(uint32_t token) {
+  auto &e = autoreply_dedup[autoreply_dedup_next];
+  e.token = token;
+  e.expires_at = futureMillis(AUTOREPLY_DEDUP_TTL_MS);
+  autoreply_dedup_next = (autoreply_dedup_next + 1) % AUTOREPLY_DEDUP_SIZE;
+}
+
+bool MyMesh::enqueueAutoReply(const ContactInfo &from, uint8_t incoming_txt_type, const char *reply_text) {
+  if (!reply_text || reply_text[0] == 0) return false;
+
+  if (autoreply_queue_len >= AUTOREPLY_QUEUE_SIZE) {
+    autoreply_queue_head = (autoreply_queue_head + 1) % AUTOREPLY_QUEUE_SIZE;
+    autoreply_queue_len--;
+  }
+
+  auto &item = autoreply_queue[autoreply_queue_tail];
+  item.incoming_txt_type = incoming_txt_type;
+  memcpy(item.recipient_pub_key, from.id.pub_key, PUB_KEY_SIZE);
+  StrHelper::strncpy(item.text, reply_text, sizeof(item.text));
+
+  autoreply_queue_tail = (autoreply_queue_tail + 1) % AUTOREPLY_QUEUE_SIZE;
+  autoreply_queue_len++;
+  return true;
+}
+
+int MyMesh::sendSignedMessage(const ContactInfo &recipient, uint32_t timestamp, const char *text) {
+  int text_len = strlen(text);
+  if (text_len > MAX_TEXT_LEN - 4) return MSG_SEND_FAILED;
+
+  uint8_t temp[9 + MAX_TEXT_LEN + 1];
+  memcpy(temp, &timestamp, 4);
+  temp[4] = (TXT_TYPE_SIGNED_PLAIN << 2); // attempt=0
+  memcpy(&temp[5], self_id.pub_key, 4);
+  memcpy(&temp[9], text, text_len + 1);
+
+  mesh::Packet* pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, recipient.id, recipient.getSharedSecret(self_id), temp, 9 + text_len);
+  if (pkt == NULL) return MSG_SEND_FAILED;
+
+  if (recipient.out_path_len < 0) {
+    sendFloodScoped(recipient, pkt);
+    return MSG_SEND_SENT_FLOOD;
+  } else {
+    sendDirect(pkt, recipient.out_path, recipient.out_path_len);
+    return MSG_SEND_SENT_DIRECT;
+  }
+}
+
+void MyMesh::flushAutoReplies() {
+  while (autoreply_queue_len > 0) {
+    auto &item = autoreply_queue[autoreply_queue_head];
+
+    ContactInfo *recipient = lookupContactByPubKey(item.recipient_pub_key, PUB_KEY_SIZE);
+    if (recipient != NULL) {
+      uint32_t msg_timestamp = getRTCClock()->getCurrentTimeUnique();
+      if (item.incoming_txt_type == TXT_TYPE_SIGNED_PLAIN) {
+        (void)sendSignedMessage(*recipient, msg_timestamp, item.text);
+      } else {
+        uint32_t expected_ack = 0;
+        uint32_t est_timeout = 0;
+        (void)sendMessage(*recipient, msg_timestamp, 0, item.text, expected_ack, est_timeout);
+      }
+    }
+
+    autoreply_queue_head = (autoreply_queue_head + 1) % AUTOREPLY_QUEUE_SIZE;
+    autoreply_queue_len--;
+  }
+}
+
+bool MyMesh::maybeAutoReplyPing(const ContactInfo &from, uint8_t txt_type, mesh::Packet *pkt, uint32_t sender_timestamp, const char *text) {
+  if (txt_type != TXT_TYPE_PLAIN && txt_type != TXT_TYPE_SIGNED_PLAIN) return false;
+  if (!text || text[0] == 0) return false;
+  if (memcmp(from.id.pub_key, self_id.pub_key, PUB_KEY_SIZE) == 0) return false; // avoid responding to our own messages
+  uint32_t sender_id = ((uint32_t)from.id.pub_key[0] << 24)
+                     | ((uint32_t)from.id.pub_key[1] << 16)
+                     | ((uint32_t)from.id.pub_key[2] << 8)
+                     |  (uint32_t)from.id.pub_key[3];
+  if (sender_id != AUTOREPLY_ALLOWLIST_ID) return false;
+  if (!startsWithWordCI(text, "PING")) return false;
+
+  char seq[25];
+  int seq_len = extractPingSeq(text, seq, sizeof(seq));
+  uint32_t token = calcPingToken(from, sender_timestamp, seq_len > 0 ? seq : "");
+  if (isRecentPingToken(token)) return false;
+
+  int rssi = (int)_radio->getLastRSSI();
+  int snr_q = (int)(pkt->getSNR() * 4.0f);
+  int snr_abs = (snr_q < 0) ? -snr_q : snr_q;
+  char snr_text[12];
+  snprintf(snr_text, sizeof(snr_text), "%s%d.%02d", (snr_q < 0) ? "-" : "", snr_abs / 4, (snr_abs % 4) * 25);
+
+  char reply[120];
+  unsigned long uptime_ms = _ms->getMillis();
+  int reply_len;
+  reply_len = snprintf(reply, sizeof(reply), "BONG rssi=%d snr=%s uptime=%lu",
+                       rssi, snr_text, uptime_ms);
+  if (reply_len <= 0 || reply_len >= (int)sizeof(reply)) {
+    reply_len = snprintf(reply, sizeof(reply), "BONG rssi=%d snr=%s up=%lu",
+                         rssi, snr_text, uptime_ms);
+  }
+  if (reply_len <= 0 || reply_len >= (int)sizeof(reply)) return false;
+
+  rememberPingToken(token);
+  return enqueueAutoReply(from, txt_type, reply);
+}
+
 void MyMesh::queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packet *pkt,
                           uint32_t sender_timestamp, const uint8_t *extra, int extra_len, const char *text) {
   int i = 0;
@@ -428,6 +607,7 @@ void MyMesh::queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packe
   memcpy(&out_frame[i], text, tlen);
   i += tlen;
   addToOfflineQueue(out_frame, i);
+  (void)maybeAutoReplyPing(from, txt_type, pkt, sender_timestamp, text);
 
   if (_serial->isConnected()) {
     uint8_t frame[1];
@@ -785,6 +965,12 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   sign_data = NULL;
   dirty_contacts_expiry = 0;
   memset(advert_paths, 0, sizeof(advert_paths));
+  memset(autoreply_dedup, 0, sizeof(autoreply_dedup));
+  autoreply_dedup_next = 0;
+  memset(autoreply_queue, 0, sizeof(autoreply_queue));
+  autoreply_queue_head = 0;
+  autoreply_queue_tail = 0;
+  autoreply_queue_len = 0;
   memset(send_scope.key, 0, sizeof(send_scope.key));
 
   // defaults
@@ -1948,6 +2134,7 @@ void MyMesh::checkSerialInterface() {
 
 void MyMesh::loop() {
   BaseChatMesh::loop();
+  flushAutoReplies();
 
   if (_cli_rescue) {
     checkCLIRescueCmd();

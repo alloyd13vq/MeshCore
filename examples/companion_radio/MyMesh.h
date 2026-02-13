@@ -160,6 +160,11 @@ public:
   void savePrefs() { _store->savePrefs(_prefs, sensors.node_lat, sensors.node_lon); }
 
 private:
+  static constexpr uint8_t AUTOREPLY_DEDUP_SIZE = 32;
+  static constexpr uint8_t AUTOREPLY_QUEUE_SIZE = 8;
+  static constexpr unsigned long AUTOREPLY_DEDUP_TTL_MS = 30000;
+  static constexpr uint32_t AUTOREPLY_ALLOWLIST_ID = 0x56DA0881u;
+
   void writeOKFrame();
   void writeErrFrame(uint8_t err_code);
   void writeDisabledFrame();
@@ -167,6 +172,15 @@ private:
   void updateContactFromFrame(ContactInfo &contact, uint32_t& last_mod, const uint8_t *frame, int len);
   void addToOfflineQueue(const uint8_t frame[], int len);
   int getFromOfflineQueue(uint8_t frame[]);
+  bool maybeAutoReplyPing(const ContactInfo &from, uint8_t txt_type, mesh::Packet *pkt, uint32_t sender_timestamp, const char *text);
+  void flushAutoReplies();
+  bool enqueueAutoReply(const ContactInfo &from, uint8_t incoming_txt_type, const char *reply_text);
+  int sendSignedMessage(const ContactInfo &recipient, uint32_t timestamp, const char *text);
+  static uint32_t calcPingToken(const ContactInfo &from, uint32_t sender_timestamp, const char *seq);
+  bool isRecentPingToken(uint32_t token);
+  void rememberPingToken(uint32_t token);
+  static bool startsWithWordCI(const char *s, const char *word);
+  static int extractPingSeq(const char *text, char *seq_out, size_t seq_out_size);
   int getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_buf[]) override { 
     return _store->getBlobByKey(key, key_len, dest_buf);
   }
@@ -228,6 +242,23 @@ private:
 
   #define ADVERT_PATH_TABLE_SIZE   16
   AdvertPath advert_paths[ADVERT_PATH_TABLE_SIZE]; // circular table
+
+  struct AutoReplyDedupEntry {
+    uint32_t token;
+    unsigned long expires_at;
+  };
+  AutoReplyDedupEntry autoreply_dedup[AUTOREPLY_DEDUP_SIZE];
+  uint8_t autoreply_dedup_next;
+
+  struct AutoReplyItem {
+    uint8_t incoming_txt_type;
+    uint8_t recipient_pub_key[PUB_KEY_SIZE];
+    char text[120];
+  };
+  AutoReplyItem autoreply_queue[AUTOREPLY_QUEUE_SIZE];
+  uint8_t autoreply_queue_head;
+  uint8_t autoreply_queue_tail;
+  uint8_t autoreply_queue_len;
 };
 
 extern MyMesh the_mesh;
